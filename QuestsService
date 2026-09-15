@@ -1,0 +1,401 @@
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local QuestRemote = ReplicatedStorage.Events.Remotes.QuestsRemote
+local QuestStore = DataStoreService:GetDataStore("QuestsData")
+
+local AutosaveInterval = 60
+local SaveDebounceInterval = 5
+
+local QuestService = {}
+
+local QuestDefinitions = {}
+local ActiveQuests = {}
+local CompletedQuests = {}
+
+local DirtyPlayers = {}
+
+local Initialized = false
+
+local function WarnFormat(Format, ...)
+	warn(("[QuestService] " .. Format):format(...))
+end
+
+local function KeyFor(Player)
+	return "Player_" .. Player.UserId
+end
+
+local function IsValidDefinition(Definition)
+	if typeof(Definition) ~= "table" then
+		return false
+	end
+	if typeof(Definition.Id) ~= "string" then
+		return false
+	end
+	if typeof(Definition.Description) ~= "string" then
+		return false
+	end
+	if typeof(Definition.Required) ~= "number" or Definition.Required <= 0 then
+		return false
+	end
+	if Definition.Reward ~= nil and typeof(Definition.Reward) ~= "function" then
+		return false
+	end
+	return true
+end
+
+local function SanitizeLoaded(Raw)
+	local Clean = {}
+
+	if typeof(Raw) ~= "table" then
+		return Clean
+	end
+
+	for QuestId, Entry in pairs(Raw) do
+		local EntryIsValid = typeof(Entry) == "table"
+			and typeof(Entry.Progress) == "number"
+			and typeof(Entry.Completed) == "boolean"
+
+		if EntryIsValid then
+			Clean[QuestId] = {
+				Progress = Entry.Progress,
+				Completed = Entry.Completed,
+			}
+		end
+	end
+
+	return Clean
+end
+
+local function LoadPlayerData(Player)
+	local Success, Result = pcall(function()
+		return QuestStore:GetAsync(KeyFor(Player))
+	end)
+
+	if not Success then
+		WarnFormat("Load failed for %s: %s", Player.Name, tostring(Result))
+		return {}
+	end
+
+	return SanitizeLoaded(Result)
+end
+
+local function SavePlayerData(Player)
+	local Data = ActiveQuests[Player]
+	local Completed = CompletedQuests[Player]
+
+	if not Data and not Completed then
+		return
+	end
+
+	local Payload = {}
+
+	for QuestId, Quest in pairs(Data or {}) do
+		if not Quest.Completed then
+			Payload[QuestId] = {
+				Progress = Quest.Progress,
+				Completed = false,
+			}
+		end
+	end
+
+	for QuestId in pairs(Completed or {}) do
+		if not Payload[QuestId] then
+			Payload[QuestId] = {
+				Progress = 0,
+				Completed = true,
+			}
+		end
+	end
+
+	local Success, Error = pcall(function()
+		QuestStore:SetAsync(KeyFor(Player), Payload)
+	end)
+
+	if not Success then
+		WarnFormat("Save failed for %s: %s", Player.Name, tostring(Error))
+	end
+end
+
+local function MarkDirty(Player)
+	if Player and Player.Parent then
+		DirtyPlayers[Player] = true
+	end
+end
+
+local function LoadQuestDefinitions()
+	local Shared = ReplicatedStorage:WaitForChild("Shared")
+	local QuestsFolder = Shared:WaitForChild("Quests")
+
+	for _, Module in ipairs(QuestsFolder:GetChildren()) do
+		if not Module:IsA("ModuleScript") then
+			continue
+		end
+
+		local Ok, Definition = pcall(require, Module)
+
+		if not Ok then
+			WarnFormat("Failed to require %s: %s", Module.Name, tostring(Definition))
+			continue
+		end
+
+		if IsValidDefinition(Definition) then
+			QuestDefinitions[Definition.Id] = Definition
+		else
+			WarnFormat("Invalid definition in %s", Module.Name)
+		end
+	end
+end
+
+local function SendStarted(Player, Quest)
+	QuestRemote:FireClient(Player, "Started", {
+		Id = Quest.Id,
+		Description = Quest.Description,
+		Required = Quest.Required,
+		Progress = 0,
+	})
+end
+
+local function SendProgress(Player, Quest)
+	QuestRemote:FireClient(Player, "Progress", {
+		Id = Quest.Id,
+		Description = Quest.Description,
+		Progress = Quest.Progress,
+		Required = Quest.Required,
+	})
+end
+
+local function SendCompleted(Player, QuestId)
+	QuestRemote:FireClient(Player, "Completed", { Id = QuestId })
+end
+
+local function HydrateAndSend(Player, Saved)
+	ActiveQuests[Player] = ActiveQuests[Player] or {}
+	CompletedQuests[Player] = CompletedQuests[Player] or {}
+
+	for QuestId, SavedEntry in pairs(Saved) do
+		local Definition = QuestDefinitions[QuestId]
+
+		if not Definition then
+			WarnFormat("Unknown quest id in save for %s: %s", Player.Name, QuestId)
+			continue
+		end
+
+		if SavedEntry.Completed then
+			CompletedQuests[Player][QuestId] = true
+			continue
+		end
+
+		local Quest = {
+			Id = Definition.Id,
+			Description = Definition.Description,
+			Required = Definition.Required,
+			Progress = math.clamp(SavedEntry.Progress, 0, Definition.Required),
+			Completed = false,
+		}
+
+		ActiveQuests[Player][QuestId] = Quest
+
+		SendStarted(Player, Quest)
+
+		if Quest.Progress > 0 then
+			SendProgress(Player, Quest)
+		end
+	end
+end
+
+function QuestService:RegisterQuest(Definition)
+	assert(IsValidDefinition(Definition), "Invalid quest definition")
+	QuestDefinitions[Definition.Id] = Definition
+end
+
+function QuestService:StartQuest(Player, QuestOrId)
+	local QuestId = typeof(QuestOrId) == "table" and QuestOrId.Id or QuestOrId
+	local Definition = typeof(QuestOrId) == "table" and QuestOrId or QuestDefinitions[QuestId]
+
+	if not Definition then
+		WarnFormat("StartQuest: unknown quest '%s'", tostring(QuestId))
+		return
+	end
+
+	ActiveQuests[Player] = ActiveQuests[Player] or {}
+
+	if ActiveQuests[Player][Definition.Id] then
+		return
+	end
+
+	local Quest = {
+		Id = Definition.Id,
+		Description = Definition.Description,
+		Required = Definition.Required,
+		Progress = 0,
+		Completed = false,
+	}
+
+	ActiveQuests[Player][Definition.Id] = Quest
+
+	SendStarted(Player, Quest)
+	MarkDirty(Player)
+end
+
+local function CompleteQuest(Player, Quest)
+	Quest.Completed = true
+	SendCompleted(Player, Quest.Id)
+
+	local Definition = QuestDefinitions[Quest.Id]
+
+	if Definition and typeof(Definition.Reward) == "function" then
+		local Ok, Error = pcall(Definition.Reward, Player)
+		if not Ok then
+			WarnFormat("Reward failed for %s (%s): %s", Player.Name, Quest.Id, tostring(Error))
+		end
+	end
+
+	CompletedQuests[Player] = CompletedQuests[Player] or {}
+	CompletedQuests[Player][Quest.Id] = true
+	ActiveQuests[Player][Quest.Id] = nil
+end
+
+function QuestService:AddProgress(Player, Amount, QuestId)
+	local Data = ActiveQuests[Player]
+
+	if not Data then
+		return
+	end
+
+	local function Bump(Quest)
+		if Quest.Completed then
+			return
+		end
+
+		Quest.Progress = math.min(Quest.Progress + Amount, Quest.Required)
+		SendProgress(Player, Quest)
+
+		if Quest.Progress >= Quest.Required then
+			CompleteQuest(Player, Quest)
+		end
+	end
+
+	if QuestId then
+		local Quest = Data[QuestId]
+		if Quest then
+			Bump(Quest)
+		end
+	else
+		for _, Quest in pairs(Data) do
+			Bump(Quest)
+		end
+	end
+
+	MarkDirty(Player)
+end
+
+function QuestService:GetActiveQuest(Player, QuestId)
+	local Data = ActiveQuests[Player]
+
+	if not Data then
+		return nil
+	end
+
+	if QuestId then
+		return Data[QuestId]
+	end
+
+	return Data
+end
+
+function QuestService:IsCompleted(Player, QuestId)
+	local Completed = CompletedQuests[Player]
+	return Completed ~= nil and Completed[QuestId] == true
+end
+
+function QuestService:Save(Player)
+	SavePlayerData(Player)
+	DirtyPlayers[Player] = nil
+end
+
+function QuestService:GetDefinition(QuestId)
+	return QuestDefinitions[QuestId]
+end
+
+function QuestService:GetAllDefinitions()
+	return QuestDefinitions
+end
+
+function QuestService:Init()
+	if Initialized then
+		WarnFormat("Init() called twice — ignoring")
+		return
+	end
+
+	Initialized = true
+
+	LoadQuestDefinitions()
+
+	local function OnPlayerAdded(Player)
+		local Saved = LoadPlayerData(Player)
+		HydrateAndSend(Player, Saved)
+	end
+
+	for _, Player in ipairs(Players:GetPlayers()) do
+		task.spawn(OnPlayerAdded, Player)
+	end
+
+	Players.PlayerAdded:Connect(OnPlayerAdded)
+
+	Players.PlayerRemoving:Connect(function(Player)
+		if DirtyPlayers[Player] then
+			SavePlayerData(Player)
+			DirtyPlayers[Player] = nil
+		else
+			SavePlayerData(Player)
+		end
+
+		ActiveQuests[Player] = nil
+		CompletedQuests[Player] = nil
+		DirtyPlayers[Player] = nil
+	end)
+
+	task.spawn(function()
+		while true do
+			task.wait(SaveDebounceInterval)
+
+			for Player in pairs(DirtyPlayers) do
+				if Player.Parent then
+					SavePlayerData(Player)
+					DirtyPlayers[Player] = nil
+				end
+			end
+		end
+	end)
+
+	task.spawn(function()
+		while true do
+			task.wait(AutosaveInterval)
+
+			for _, Player in ipairs(Players:GetPlayers()) do
+				SavePlayerData(Player)
+			end
+		end
+	end)
+
+	game:BindToClose(function()
+		local Threads = {}
+
+		for _, Player in ipairs(Players:GetPlayers()) do
+			table.insert(Threads, task.spawn(function()
+				SavePlayerData(Player)
+			end))
+		end
+
+		local Deadline = os.clock() + 10
+		for _, Thread in ipairs(Threads) do
+			while coroutine.status(Thread) ~= "dead" and os.clock() < Deadline do
+				task.wait(0.1)
+			end
+		end
+	end)
+end
+
+return QuestService
