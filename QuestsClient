@@ -1,0 +1,268 @@
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local QuestRemote = ReplicatedStorage.Events.Remotes.QuestsRemote
+
+local QuestsFrame = script.Parent
+local QuestsContainer = QuestsFrame.List
+local Template = QuestsContainer.Template
+
+local OriginalPosition = QuestsFrame.Position
+local HiddenPosition = UDim2.new(
+	1.01,
+	OriginalPosition.X.Offset,
+	OriginalPosition.Y.Scale,
+	OriginalPosition.Y.Offset
+)
+
+local TweenInfoSet = {
+	SlideIn  = TweenInfo.new(0.5,  Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+	SlideOut = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+	Icon     = TweenInfo.new(0.4,  Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+	FadeOut  = TweenInfo.new(0.3,  Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+}
+
+local FadeProperties = {
+	ImageLabel  = "ImageTransparency",
+	TextLabel   = "TextTransparency",
+	UIStroke    = "Transparency",
+	UIShadow    = "Transparency",
+}
+
+local ActiveQuestCount = 0
+local IsVisible = false
+local CurrentSlideTween = nil
+
+local Connections = {}
+local PendingTasks = {}
+local Destroyed = false
+
+QuestsFrame.Position = HiddenPosition
+
+local function TrackConnection(Connection)
+	table.insert(Connections, Connection)
+	return Connection
+end
+
+local function TrackTask(Thread)
+	table.insert(PendingTasks, Thread)
+	return Thread
+end
+
+local function PlayTween(Instance, Info, Properties)
+	if Destroyed then
+		return nil
+	end
+
+	local NewTween = TweenService:Create(Instance, Info, Properties)
+	NewTween:Play()
+	return NewTween
+end
+
+local function SlideTo(TargetPosition, Info)
+	if Destroyed then
+		return
+	end
+
+	if CurrentSlideTween then
+		CurrentSlideTween:Cancel()
+		CurrentSlideTween = nil
+	end
+
+	CurrentSlideTween = PlayTween(QuestsFrame, Info, { Position = TargetPosition })
+end
+
+local function SetVisible(Visible)
+	if Destroyed then
+		return
+	end
+
+	if Visible == IsVisible then
+		return
+	end
+
+	IsVisible = Visible
+
+	if Visible then
+		SlideTo(OriginalPosition, TweenInfoSet.SlideIn)
+	else
+		SlideTo(HiddenPosition, TweenInfoSet.SlideOut)
+	end
+end
+
+local function GetIcon(QuestFrame)
+	local Box = QuestFrame:FindFirstChild("Box")
+	if not Box then
+		return nil
+	end
+	return Box:FindFirstChild("Icon")
+end
+
+local function SetIconCompleted(QuestFrame, Completed)
+	if Destroyed then
+		return
+	end
+
+	local Icon = GetIcon(QuestFrame)
+	if not Icon then
+		return
+	end
+
+	PlayTween(Icon, TweenInfoSet.Icon, { ImageTransparency = Completed and 0 or 1 })
+end
+
+local function FadeOutAll(Root)
+	if Destroyed then
+		return
+	end
+
+	local function Fade(Instance)
+		if not Instance:IsA("GuiObject")
+			and not Instance:IsA("UIStroke")
+			and not Instance:IsA("UIShadow") then
+			return
+		end
+
+		local Property = FadeProperties[Instance.ClassName]
+		if Property then
+			PlayTween(Instance, TweenInfoSet.FadeOut, { [Property] = 1 })
+		end
+
+		for _, Child in ipairs(Instance:GetChildren()) do
+			Fade(Child)
+		end
+	end
+
+	Fade(Root)
+end
+
+local function FadeOutQuest(QuestFrame)
+	FadeOutAll(QuestFrame)
+
+	local Thread = task.delay(TweenInfoSet.FadeOut.Time, function()
+		if QuestFrame.Parent then
+			QuestFrame:Destroy()
+		end
+	end)
+
+	TrackTask(Thread)
+end
+
+local function UpdateQuestLabel(QuestFrame, Data)
+	if Destroyed then
+		return
+	end
+
+	QuestFrame.QuestLabel.Text = string.format(
+		"%s (%d/%d)",
+		Data.Description,
+		Data.Progress or 0,
+		Data.Required
+	)
+end
+
+local function CreateQuest(Data)
+	if Destroyed then
+		return nil
+	end
+
+	local QuestFrame = Template:Clone()
+	QuestFrame.Name = Data.Id
+	QuestFrame.Visible = true
+	QuestFrame.Parent = QuestsContainer
+
+	UpdateQuestLabel(QuestFrame, Data)
+	SetIconCompleted(QuestFrame, false)
+
+	ActiveQuestCount += 1
+	SetVisible(true)
+
+	return QuestFrame
+end
+
+local function TryHideIfEmpty()
+	if Destroyed then
+		return
+	end
+
+	if ActiveQuestCount == 0 then
+		SetVisible(false)
+	end
+end
+
+TrackConnection(QuestRemote.OnClientEvent:Connect(function(Action, Data)
+	if Destroyed then
+		return
+	end
+
+	if Action == "Started" then
+		if not QuestsContainer:FindFirstChild(Data.Id) then
+			CreateQuest(Data)
+		end
+
+	elseif Action == "Progress" then
+		local QuestFrame = QuestsContainer:FindFirstChild(Data.Id)
+		if QuestFrame then
+			UpdateQuestLabel(QuestFrame, Data)
+		end
+
+	elseif Action == "Completed" then
+		local QuestFrame = QuestsContainer:FindFirstChild(Data.Id)
+		if not QuestFrame then
+			return
+		end
+
+		if QuestFrame:GetAttribute("CountedCompleted") then
+			return
+		end
+
+		QuestFrame:SetAttribute("CountedCompleted", true)
+		SetIconCompleted(QuestFrame, true)
+
+		ActiveQuestCount = math.max(0, ActiveQuestCount - 1)
+
+		local Thread = task.delay(TweenInfoSet.Icon.Time + 0.5, function()
+			if Destroyed then
+				return
+			end
+
+			if QuestFrame.Parent then
+				FadeOutQuest(QuestFrame)
+			end
+
+			TryHideIfEmpty()
+		end)
+
+		TrackTask(Thread)
+	end
+end))
+
+local function Cleanup()
+	if Destroyed then
+		return
+	end
+
+	Destroyed = true
+
+	if CurrentSlideTween then
+		CurrentSlideTween:Cancel()
+		CurrentSlideTween = nil
+	end
+
+	for _, Connection in ipairs(Connections) do
+		pcall(function()
+			Connection:Disconnect()
+		end)
+	end
+	table.clear(Connections)
+
+	for _, Thread in ipairs(PendingTasks) do
+		pcall(function()
+			task.cancel(Thread)
+		end)
+	end
+	table.clear(PendingTasks)
+end
+
+TrackConnection(QuestsFrame.Destroying:Connect(Cleanup))
+TrackConnection(script.Destroying:Connect(Cleanup))
